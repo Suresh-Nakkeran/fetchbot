@@ -5,6 +5,7 @@
 package fetchbot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/temoto/robotstxt"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -47,6 +49,10 @@ const (
 	// If no URL is sent for a given host within this duration, this host's goroutine
 	// is disposed of.
 	DefaultWorkerIdleTTL = 30 * time.Second
+
+	// DefaultThreadsPerSite is the default value for ThreadsPerSite, the number of
+	// concurrent workers for the same site
+	DefaultThreadsPerSite = 1
 )
 
 // Doer defines the method required to use a type as HttpClient.
@@ -97,6 +103,9 @@ type Fetcher struct {
 	// concurrent access to the hosts field.
 	mu    sync.Mutex
 	hosts map[string]chan Command
+
+	// ThreadsPerSite is the number of concurrent workers for the same site.
+	ThreadsPerSite int64
 }
 
 // The DebugInfo holds information to introspect the Fetcher's state.
@@ -107,12 +116,13 @@ type DebugInfo struct {
 // New returns an initialized Fetcher.
 func New(h Handler) *Fetcher {
 	return &Fetcher{
-		Handler:       h,
-		CrawlDelay:    DefaultCrawlDelay,
-		HttpClient:    http.DefaultClient,
-		UserAgent:     DefaultUserAgent,
-		WorkerIdleTTL: DefaultWorkerIdleTTL,
-		dbg:           make(chan *DebugInfo, 1),
+		Handler:        h,
+		CrawlDelay:     DefaultCrawlDelay,
+		HttpClient:     http.DefaultClient,
+		UserAgent:      DefaultUserAgent,
+		WorkerIdleTTL:  DefaultWorkerIdleTTL,
+		dbg:            make(chan *DebugInfo, 1),
+		ThreadsPerSite: DefaultThreadsPerSite,
 	}
 }
 
@@ -354,8 +364,13 @@ func (f *Fetcher) processChan(ch <-chan Command, hostKey string) {
 		wait  <-chan time.Time
 		ttl   <-chan time.Time
 		delay = f.CrawlDelay
+		sema  *semaphore.Weighted
 	)
 
+	if f.ThreadsPerSite > 0 {
+		sema = semaphore.NewWeighted(f.ThreadsPerSite)
+	}
+	ttlWatchTicker := time.NewTicker(5 * time.Second)
 loop:
 	for {
 		select {
@@ -392,14 +407,12 @@ loop:
 
 			case agent == nil || agent.Test(v.URL().Path):
 				// Path allowed, process the request
-				res, err := f.doRequest(v)
-				f.visit(v, res, err)
-				// No delay on error - the remote host was not reached
-				if err == nil {
-					wait = time.After(delay)
-				} else {
-					wait = nil
-				}
+				sema.Acquire(context.Background(), 1)
+				go func() {
+					res, err := f.doRequest(v)
+					f.visit(v, res, err)
+					sema.Release(1)
+				}()
 
 			default:
 				// Path disallowed by robots.txt
@@ -408,6 +421,14 @@ loop:
 			}
 			// Every time a command is received, reset the ttl channel
 			ttl = time.After(f.WorkerIdleTTL)
+
+		case <-ttlWatchTicker.C:
+			// Check for active command for every 5 seconds, if yes reset the ttl.
+			if sema.TryAcquire(f.ThreadsPerSite) == true {
+				sema.Release(f.ThreadsPerSite)
+			} else {
+				ttl = time.After(f.WorkerIdleTTL)
+			}
 
 		case <-ttl:
 			// Worker has been idle for WorkerIdleTTL, terminate it
